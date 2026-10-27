@@ -34,9 +34,10 @@ Add ±10% random jitter so keys made together don't expire together.
 
 ## In-process cache template (TypeScript, no dependencies)
 
-TTL, size cap (oldest out first), single-flight loading, no caching of errors. `Map` keeps insertion order, so re-inserting on read makes this an LRU.
+TTL, size cap (oldest out first), single-flight loading, no caching of errors, and no stale write-back: if a key is deleted or set while a load is running, that load's result is returned to its callers but not stored. `Map` keeps insertion order, so re-inserting on read makes this an LRU.
 
 ```ts
+// file: cache.ts
 type Entry<V> = { value: V; expiresAt: number };
 
 export function createCache<V>(opts: { ttlMs: number; max: number; jitter?: number }) {
@@ -44,11 +45,22 @@ export function createCache<V>(opts: { ttlMs: number; max: number; jitter?: numb
   const loading = new Map<string, Promise<V>>();
   const jitter = opts.jitter ?? 0.1;
 
-  function set(key: string, value: V) {
+  function store(key: string, value: V) {
     const ttl = opts.ttlMs * (1 + (Math.random() * 2 - 1) * jitter);
     entries.delete(key);
     entries.set(key, { value, expiresAt: Date.now() + ttl });
     while (entries.size > opts.max) entries.delete(entries.keys().next().value!);
+  }
+
+  // A write wins over any load already running for the key: that load read the old data.
+  function set(key: string, value: V) {
+    loading.delete(key);
+    store(key, value);
+  }
+
+  function invalidate(key: string) {
+    loading.delete(key);
+    entries.delete(key);
   }
 
   function get(key: string): V | undefined {
@@ -65,20 +77,34 @@ export function createCache<V>(opts: { ttlMs: number; max: number; jitter?: numb
     if (hit !== undefined) return hit;
     const inFlight = loading.get(key);
     if (inFlight) return inFlight;
-    const p = load()
-      .then((v) => { set(key, v); return v; })
-      .finally(() => loading.delete(key));
+    const p: Promise<V> = load()
+      .then((v) => {
+        // Store only if no write or delete happened while loading; otherwise v may be stale.
+        if (loading.get(key) === p) store(key, v);
+        return v;
+      })
+      .finally(() => {
+        if (loading.get(key) === p) loading.delete(key);
+      });
     loading.set(key, p);
     return p;
   }
 
-  return { get, set, getOrLoad, delete: (k: string) => entries.delete(k), clear: () => entries.clear() };
+  return {
+    get,
+    set,
+    getOrLoad,
+    delete: invalidate,
+    clear: () => { loading.clear(); entries.clear(); },
+  };
 }
 ```
 
-Usage: `const settings = createCache<Settings>({ ttlMs: 10 * 60_000, max: 5_000 });` then `settings.getOrLoad(\`settings:${userId}\`, () => db.loadSettings(userId))`, and `settings.delete(\`settings:${userId}\`)` right after every write to that user's settings.
+Usage: `const settings = createCache<Settings>({ ttlMs: 10 * 60_000, max: 5_000 });` then `settings.getOrLoad(\`settings:${userId}\`, () => db.loadSettings(userId))`, and `settings.delete(\`settings:${userId}\`)` right **after** every write to that user's settings commits.
 
-Tests to write for it: hit, miss, expiry, size cap evicts the oldest, two parallel `getOrLoad` calls run the loader once, a failed load is not cached.
+Callers that were already waiting on a load when the write happened still get the value that load read. That's fine: they asked before the write. Only the cache must not keep it.
+
+Tests to write for it: hit, miss, expiry, size cap evicts the oldest, two parallel `getOrLoad` calls run the loader once, a failed load is not cached, and a delete or set during a load is not overwritten by that load's old result.
 
 ## When Redis is actually needed
 
@@ -93,6 +119,7 @@ Ask the user first: it's a new service, a new dependency and a new bill.
 ## Redis rules (once you have it)
 
 - Still cache-aside, still a TTL on every key (`SET key value EX seconds`). Set `maxmemory` and an eviction policy (`allkeys-lru` for a pure cache).
+- The stale write-back race exists across copies too: copy A reads old data from the DB, copy B writes and deletes the key, then A stores what it read. Keep TTLs short for data that changes, delete after the write commits, and for data that must never be stale put a version in the key (bumped on write) or skip the cache.
 - Namespaced, versioned keys: `app:v1:user:{id}:settings`. Bump the version to drop a whole shape after a schema change.
 - **Redis down = slower, not broken**: wrap calls with a short timeout and fall back to the database.
 - Stampede: single-flight per process, plus `SET lock:key 1 NX EX 10` if loads are expensive across copies.

@@ -4,8 +4,8 @@ description: "Production engineering rules for backend code: caching (in-memory,
 license: MIT
 metadata:
   author: Kush Ahuja (https://www.thekush.codes)
-  version: "1.1.0"
-  date: 2026-10-27
+  version: "1.1.1"
+  date: 2026-10-28
   sources: "Own rules. Ideas adapted (rewritten, not copied) from obra/superpowers (test first, verify before claiming done) and donnemartin/system-design-primer (cache strategies)."
 ---
 

@@ -12,56 +12,134 @@ Pick the timeout from the slowest normal response, plus margin. LLM calls need l
 
 ## Retry with backoff and jitter
 
+A timeout (`TimeoutError`) is retried; a cancellation by the caller (`AbortError`, or the caller's `signal` firing) is not, and it also cuts the wait between attempts short.
+
 ```ts
-const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
+// file: retry.ts
+import { setTimeout as sleep } from "node:timers/promises";
+
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_CODES = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN", "UND_ERR_SOCKET"]);
 
 export async function withRetry<T>(
-  fn: (attempt: number) => Promise<T>,
-  opts: { attempts?: number; baseMs?: number; maxMs?: number; isRetryable?: (e: unknown) => boolean } = {},
+  fn: (attempt: number, signal?: AbortSignal) => Promise<T>,
+  opts: {
+    attempts?: number;
+    baseMs?: number;
+    maxMs?: number;
+    signal?: AbortSignal; // the caller's cancel signal: stops retrying at once
+    isRetryable?: (e: unknown) => boolean;
+  } = {},
 ): Promise<T> {
-  const { attempts = 3, baseMs = 300, maxMs = 5_000 } = opts;
+  const { attempts = 3, baseMs = 300, maxMs = 5_000, signal } = opts;
   const isRetryable = opts.isRetryable ?? ((e: any) =>
-    e?.name === "TimeoutError" || e?.name === "AbortError" ||
-    e?.code === "ECONNRESET" || e?.code === "ETIMEDOUT" ||
-    RETRYABLE.has(e?.status));
+    e?.name === "TimeoutError" || // our own per-attempt timeout; AbortError means someone cancelled
+    RETRYABLE_CODES.has(e?.code) || RETRYABLE_CODES.has(e?.cause?.code) || // fetch puts it on .cause
+    RETRYABLE_STATUS.has(e?.status));
   for (let attempt = 1; ; attempt++) {
+    signal?.throwIfAborted();
     try {
-      return await fn(attempt);
+      return await fn(attempt, signal);
     } catch (e: any) {
-      if (attempt >= attempts || !isRetryable(e)) throw e;
+      if (signal?.aborted || attempt >= attempts || !isRetryable(e)) throw e;
       const retryAfter = Number(e?.retryAfterSeconds) * 1000;
       const backoff = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
-      const wait = retryAfter > 0 ? retryAfter : backoff / 2 + Math.random() * (backoff / 2);
-      await new Promise((r) => setTimeout(r, wait));
+      const wait = retryAfter > 0 ? Math.min(retryAfter, maxMs * 4) : backoff / 2 + Math.random() * (backoff / 2);
+      await sleep(wait, undefined, { signal }); // rejects with AbortError if the caller cancels mid-wait
     }
   }
 }
+```
+
+Usage with a timeout per attempt and the caller's cancel signal (Node 20.3+ for `AbortSignal.any`):
+
+```ts
+const data = await withRetry(
+  (_attempt, signal) =>
+    fetch(url, { signal: AbortSignal.any([signal ?? new AbortController().signal, AbortSignal.timeout(10_000)]) })
+      .then((r) => { if (!r.ok) throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status }); return r.json(); }),
+  { signal: req.signal },
+);
 ```
 
 Never retry a non-idempotent call (send email, charge, create event) unless it carries an idempotency key the other side honors.
 
 ## Idempotency key
 
-For anything with a side effect (send, charge, create, notify), store the key with a UNIQUE constraint and claim it before acting:
+For anything with a side effect (send, charge, create, notify), store the key with a UNIQUE constraint and claim it before acting. Every key ends in one of three states, and each one has a clear next step:
+
+| State | Meaning | Another attempt with the same key |
+|---|---|---|
+| `done` | The side effect happened | Gets the stored result; the work does not run again |
+| `failed` | The side effect threw | Claims the key and runs the work again |
+| `started` | Running now, or the worker died | Gets `InProgressError` (answer 409 or retry the job later), unless the lease ran out, in which case it takes over |
 
 ```sql
 create table if not exists idempotency_keys (
   key text primary key,
-  status text not null default 'started',  -- started | done | failed
+  status text not null check (status in ('started', 'done', 'failed')),
   result jsonb,
+  last_error text,
+  attempts int not null default 1,
+  locked_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
 ```
 
 ```ts
-// Claim: the insert succeeds for exactly one caller.
-const claimed = await db.insertIgnoreConflict("idempotency_keys", { key });
-if (!claimed) return await db.getResult(key); // already done or running: don't repeat the side effect
-const result = await doSideEffect();
-await db.update("idempotency_keys", key, { status: "done", result });
+// file: idempotency.ts
+// `query` matches node-postgres: (text, params) => Promise<{ rows }>.
+type Query = (text: string, params: unknown[]) => Promise<{ rows: any[] }>;
+
+export class InProgressError extends Error {}
+
+export async function runOnce<T>(
+  query: Query,
+  key: string,
+  sideEffect: () => Promise<T>,
+  leaseSeconds = 300, // longer than the side effect can ever take
+): Promise<T> {
+  // Claim a new key, a key whose last attempt failed, or one stuck in 'started' past its lease.
+  const claim = await query(
+    `insert into idempotency_keys (key, status) values ($1, 'started')
+     on conflict (key) do update
+       set status = 'started', locked_at = now(), last_error = null,
+           attempts = idempotency_keys.attempts + 1
+       where idempotency_keys.status = 'failed'
+          or (idempotency_keys.status = 'started'
+              and idempotency_keys.locked_at < now() - make_interval(secs => $2::int))
+     returning key`,
+    [key, leaseSeconds],
+  );
+
+  if (claim.rows.length === 0) {
+    const { rows } = await query(`select status, result from idempotency_keys where key = $1`, [key]);
+    if (rows[0]?.status === "done") return rows[0].result as T;
+    throw new InProgressError(`"${key}" is already running`);
+  }
+
+  let result: T;
+  try {
+    result = await sideEffect();
+  } catch (e) {
+    // Release the key so a later attempt runs the work again instead of finding nothing.
+    await query(
+      `update idempotency_keys set status = 'failed', last_error = $2 where key = $1`,
+      [key, String(e).slice(0, 1000)],
+    );
+    throw e;
+  }
+  await query(
+    `update idempotency_keys set status = 'done', result = $2::jsonb where key = $1`,
+    [key, JSON.stringify(result ?? null)],
+  );
+  return result;
+}
 ```
 
-Build the key from what makes the action unique: `email:{userId}:{messageHash}`, `webhook:{provider}:{eventId}`. Clean up old keys on a schedule.
+- Build the key from what makes the action unique: `email:{userId}:{messageHash}`, `webhook:{provider}:{eventId}`. Clean up old `done` keys on a schedule.
+- The result must be JSON-serializable: a repeat call gets it back from the database, not from memory.
+- This table alone can't make a side effect exactly-once. If the work succeeds but the process dies before `done` is saved, or the side effect throws after the other side already acted (a timeout after the email was accepted), the next attempt runs it again. Close that gap by also passing the key to the provider when it supports one (Stripe `Idempotency-Key`, a message id, a unique external id).
 
 ## Background jobs that survive restarts
 
@@ -102,6 +180,7 @@ Wrap fire-and-forget background writes in `track(...)` so a redeploy doesn't dro
 ## Rate limit (single copy, in memory)
 
 ```ts
+// file: ratelimit.ts
 const hits = new Map<string, { count: number; resetAt: number }>();
 
 export function allow(key: string, limit: number, windowMs: number): boolean {

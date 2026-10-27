@@ -20,7 +20,7 @@ What it makes the agent do:
 - **Cover the basics**: database indexes and N+1 queries, LLM cost and caching, input validation, authorization, secrets, logs and health checks.
 - **Test first, prove it's done**: watch the test fail before the fix, and never claim "done" without running the check in the same turn.
 
-It's self-contained and works with any stack. The code templates are TypeScript with no dependencies, and they're tested. If you also have `supabase-postgres-best-practices`, gstack or the Anthropic engineering plugin installed, it points to them for depth.
+It's self-contained and works with any stack. The code templates are TypeScript with no dependencies, and the tests in `tests/` run the exact code the docs show. If you also have `supabase-postgres-best-practices`, gstack or the Anthropic engineering plugin installed, it points to them for depth.
 
 ```
 skills/production-backend/
@@ -33,6 +33,14 @@ skills/production-backend/
     ├── security.md             input, auth, secrets, webhooks
     └── done-checklist.md       what "done" means
 ```
+
+### Tests
+
+```bash
+node --experimental-strip-types --test tests/templates.test.ts
+```
+
+Node 22.6+. The Postgres tests for the idempotency template run when PGlite is installed (`npm i --no-save @electric-sql/pglite`) and are skipped otherwise.
 
 ### Install by hand
 
