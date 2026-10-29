@@ -8,9 +8,32 @@ Skills for Claude Code, Codex, Cursor and other coding agents that support the [
 
 Makes your coding agent write backend code that holds up in production, instead of code that only works on the happy path.
 
+**Easiest: one line, works on any Node version (or none).**
+
+Mac / Linux (Terminal):
+
 ```bash
-npx skills add ahujakush/skills --skill production-backend
+curl -fsSL https://raw.githubusercontent.com/ahujakush/skills/main/install.sh | bash
 ```
+
+Windows (Command Prompt or PowerShell):
+
+```bash
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/ahujakush/skills/main/install.ps1 | iex"
+```
+
+The installer:
+- uses the `skills` CLI when Node.js 18+ is present;
+- falls back to a direct download from GitHub when it isn't;
+- installs for Claude Code, plus Codex, Cursor and Antigravity when they're on the machine.
+
+**With the skills CLI directly** (needs Node.js 22.20+):
+
+```bash
+npx skills add ahujakush/skills --skill production-backend -g -a claude-code -y
+```
+
+On Node 18 or 20 that fails with `The requested module 'node:zlib' does not provide an export named 'crc32'`. Use `npx skills@1.5.18 add …` instead, or update Node from [nodejs.org](https://nodejs.org).
 
 What it makes the agent do:
 
